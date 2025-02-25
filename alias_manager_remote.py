@@ -1,49 +1,67 @@
-import time
 import paramiko
 import logging
 
 class RemoteAliasManager:
     def __init__(self, remote_os, host, username, password):
-        self.remote_os = remote_os
+        self.remote_os = remote_os.lower()
         self.host = host
         self.username = username
         self.password = password
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Try key-based authentication first
         try:
-            self.client.connect(hostname=host, username=username, password=password)
-            logging.info("SSH connection established with %s.", host)
-        except Exception as e:
-            logging.exception("Failed to connect to %s", host)
-            raise ConnectionError(f"Failed to connect to {host}: {e}")
-        if remote_os == "osx":
-            self.profile_path = "~/.bash_profile"  # Adjust if using zsh (e.g. "~/.zshrc")
-            backup_cmd = f"if [ -f {self.profile_path} ]; then cp {self.profile_path} {self.profile_path}.bak.$(date +%Y%m%d%H%M%S); fi"
-        elif remote_os == "windows":
-            self.profile_path = r"$env:USERPROFILE\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1"
-            backup_cmd = f"if (Test-Path {self.profile_path}) {{ Copy-Item {self.profile_path} {self.profile_path}.bak.$((Get-Date).ToString('yyyyMMddHHmmss')) }}"
-        else:
-            logging.error("Unsupported remote OS type: %s", remote_os)
-            raise ValueError("Unsupported remote OS type. Use 'osx' or 'windows'.")
-        stdin, stdout, stderr = self.client.exec_command(backup_cmd)
-        error = stderr.read().decode().strip()
-        if error:
-            logging.warning("Could not backup remote profile: %s", error)
-            print(f"Warning: Could not backup remote profile: {error}")
+            self.client.connect(
+                hostname=host,
+                username=username,
+                allow_agent=True,
+                look_for_keys=True,
+                timeout=10
+            )
+            logging.info("SSH connection established with %s using key-based authentication.", host)
+        except Exception as key_exc:
+            logging.warning("Key-based authentication failed for %s: %s", host, key_exc)
+            # Fallback to password authentication if key-based fails
+            try:
+                self.client.connect(
+                    hostname=host,
+                    username=username,
+                    password=password,
+                    allow_agent=False,
+                    look_for_keys=False,
+                    timeout=10
+                )
+                logging.info("SSH connection established with %s using password authentication.", host)
+            except Exception as pass_exc:
+                logging.exception("Password authentication failed for %s", host)
+                raise ConnectionError(
+                    f"Failed to connect to {host} using both key-based and password authentication: {pass_exc}"
+                )
+
     def create_alias(self, alias_name, command):
         if self.remote_os == "osx":
+            # For OSX, append alias to ~/.bash_profile (adjust if using zsh)
+            profile_path = "~/.bash_profile"
             alias_line = f"alias {alias_name}='{command}'"
-            cmd = f'echo "{alias_line}" >> {self.profile_path}'
+            cmd = f'echo "{alias_line}" >> {profile_path}'
+        elif self.remote_os == "windows":
+            # For Windows, create a .bat file in C:\Windows\System32
+            bat_file = f"C:\\Windows\\System32\\{alias_name}.bat"
+            # Use PowerShell command to set the file content; note the newline represented by `n in PowerShell
+            alias_content = f"@echo off`n{command}"
+            cmd = f"powershell -Command \"Set-Content -Path '{bat_file}' -Value '{alias_content}'\""
         else:
-            alias_line = f"Set-Alias {alias_name} {command}"
-            cmd = f'echo {alias_line} | Out-File -Append -FilePath {self.profile_path}'
+            raise ValueError("Unsupported remote OS type. Use 'osx' or 'windows'.")
+
         stdin, stdout, stderr = self.client.exec_command(cmd)
         error = stderr.read().decode().strip()
         if error:
             logging.error("Failed to create alias on remote machine: %s", error)
             raise IOError(f"Failed to create alias on remote machine: {error}")
-        logging.info("Added alias '%s' to remote profile %s on host %s.", alias_name, self.profile_path, self.host)
-        print(f"Added alias '{alias_name}' to remote profile {self.profile_path} on host {self.host}.")
+        logging.info("Added alias '%s' to remote machine on host %s.", alias_name, self.host)
+        print(f"Added alias '{alias_name}' on remote machine ({self.remote_os}) at host {self.host}.")
+
     def __del__(self):
         if self.client:
             self.client.close()
